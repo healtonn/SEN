@@ -1,102 +1,148 @@
 #!/usr/bin/env python
-import fcntl
-import struct
-import array
-import bluetooth
-import bluetooth._bluetooth as bt
-
-import time
 import os
-import datetime
+import sys
+import struct
+import json
+import time
+import bluetooth._bluetooth as bluez
+import bluetooth
 
-def bluetooth_rssi(addr):
-    # Open hci socket
-    hci_sock = bt.hci_open_dev()
-    hci_fd = hci_sock.fileno()
-
-    # Connect to device (to whatever you like)
-    bt_sock = bluetooth.BluetoothSocket(bluetooth.L2CAP)
-    bt_sock.settimeout(10)
-    result = bt_sock.connect_ex((addr, 1))	# PSM 1 - Service Discovery
-
-    try:
-        # Get ConnInfo
-        reqstr = struct.pack("6sB17s", bt.str2ba(addr), bt.ACL_LINK, "\0" * 17)
-        request = array.array("c", reqstr )
-        handle = fcntl.ioctl(hci_fd, bt.HCIGETCONNINFO, request, 1)
-        handle = struct.unpack("8xH14x", request.tostring())[0]
-
-        # Get RSSI
-        cmd_pkt=struct.pack('H', handle)
-        rssi = bt.hci_send_req(hci_sock, bt.OGF_STATUS_PARAM,
-                     bt.OCF_READ_RSSI, bt.EVT_CMD_COMPLETE, 4, cmd_pkt)
-        rssi = struct.unpack('b', rssi[3])[0]
-
-        # Close sockets
-        bt_sock.close()
-        hci_sock.close()
-
-        return rssi
-
-    except:
-        return None
+def printpacket(pkt):
+    for c in pkt:
+        sys.stdout.write("%02x " % struct.unpack("B",c)[0])
+    print()
 
 
+def read_inquiry_mode(sock):
+    """returns the current mode, or -1 on failure"""
+    # save current filter
+    old_filter = sock.getsockopt( bluez.SOL_HCI, bluez.HCI_FILTER, 14)
 
-far = True
-far_count = 0
+    # Setup socket filter to receive only events related to the
+    # read_inquiry_mode command
+    flt = bluez.hci_filter_new()
+    opcode = bluez.cmd_opcode_pack(bluez.OGF_HOST_CTL,
+            bluez.OCF_READ_INQUIRY_MODE)
+    bluez.hci_filter_set_ptype(flt, bluez.HCI_EVENT_PKT)
+    bluez.hci_filter_set_event(flt, bluez.EVT_CMD_COMPLETE);
+    bluez.hci_filter_set_opcode(flt, opcode)
+    sock.setsockopt( bluez.SOL_HCI, bluez.HCI_FILTER, flt )
 
-# assume phone is initially far away
-rssi = -255
-rssi_prev1 = -255
-rssi_prev2 = -255
+    # first read the current inquiry mode.
+    bluez.hci_send_cmd(sock, bluez.OGF_HOST_CTL,
+            bluez.OCF_READ_INQUIRY_MODE )
 
-near_cmd = 'br -n 1'
-far_cmd = 'br -f 1'
+    pkt = sock.recv(255)
 
-dagar_addr = '4C:DD:31:41:83:1B' #samsung
-emily_addr = '43:29:B1:55:00:00'
+    status,mode = struct.unpack("xxxxxxBB", pkt)
+    if status != 0: mode = -1
 
-debug = 1
+    # restore old filter
+    sock.setsockopt( bluez.SOL_HCI, bluez.HCI_FILTER, old_filter )
+    return mode
+
+def device_inquiry_with_with_rssi(sock):
+    # save current filter
+    old_filter = sock.getsockopt( bluez.SOL_HCI, bluez.HCI_FILTER, 14)
+
+    # perform a device inquiry on bluetooth device #0
+    # The inquiry should last 8 * 1.28 = 10.24 seconds
+    # before the inquiry is performed, bluez should flush its cache of
+    # previously discovered devices
+    flt = bluez.hci_filter_new()
+    bluez.hci_filter_all_events(flt)
+    bluez.hci_filter_set_ptype(flt, bluez.HCI_EVENT_PKT)
+    sock.setsockopt( bluez.SOL_HCI, bluez.HCI_FILTER, flt )
+
+    duration = 4
+    max_responses = 255
+    cmd_pkt = struct.pack("BBBBB", 0x33, 0x8b, 0x9e, duration, max_responses)
+    bluez.hci_send_cmd(sock, bluez.OGF_LINK_CTL, bluez.OCF_INQUIRY, cmd_pkt)
+
+    results = []
+
+    done = False
+    while not done:
+        pkt = sock.recv(255)
+        ptype, event, plen = struct.unpack("BBB", pkt[:3])
+        if event == bluez.EVT_INQUIRY_RESULT_WITH_RSSI:
+            pkt = pkt[3:]
+            nrsp = bluetooth.get_byte(pkt[0])
+            for i in range(nrsp):
+                addr = bluez.ba2str( pkt[1+6*i:1+6*i+6] )
+                rssi = bluetooth.byte_to_signed_int(
+                        bluetooth.get_byte(pkt[1+13*nrsp+i]))
+                results.append( ( addr, rssi ) )
+        elif event == bluez.EVT_INQUIRY_COMPLETE:
+            done = True
+        elif event == bluez.EVT_CMD_STATUS:
+            status, ncmd, opcode = struct.unpack("BBH", pkt[3:7])
+            if status != 0:
+                print("uh oh...")
+                printpacket(pkt[3:7])
+                done = True
+        elif event == bluez.EVT_INQUIRY_RESULT:
+            pkt = pkt[3:]
+            nrsp = bluetooth.get_byte(pkt[0])
+            for i in range(nrsp):
+                addr = bluez.ba2str( pkt[1+6*i:1+6*i+6] )
+                results.append( ( addr, -1 ) )
+                print("[%s] (no RRSI)" % addr)
+        else:
+            print("unrecognized packet type 0x%02x" % ptype)
+
+
+    # restore old filter
+    sock.setsockopt( bluez.SOL_HCI, bluez.HCI_FILTER, old_filter )
+
+    return results
+
+
+def estimate_range(rssi):
+    default_RSSI = -42 # rssi value at 1 meter
+    
+    range = 1
+
+    return range
+
+dev_id = 0
+try:
+    sock = bluez.hci_open_dev(dev_id)
+except:
+    print("error accessing bluetooth device...")
+    sys.exit(1)
+
+try:
+    mode = read_inquiry_mode(sock)
+except Exception as e:
+    print("error reading inquiry mode.  ")
+    print("Are you sure this a bluetooth 1.2 device?")
+    print(e)
+    sys.exit(1)
+
+nearby = bluetooth.discover_devices(lookup_names=True)
+list_of_devices = {}
+for addr, name in nearby:
+    print addr, name
+    list_of_devices[addr] = name
+
+
+
+time_now = time.time()
 
 while True:
-    # get rssi reading for address
-    rssi = bluetooth_rssi(dagar_addr)
+    if time.time() - time_now > 15:
+        nearby = bluetooth.discover_devices(lookup_names=True)
+        for addr, name in nearby:
+            list_of_devices[addr] = name
 
-    if debug:
-        print datetime.datetime.now(), rssi, rssi_prev1, rssi_prev2, far, far_count
-
-
-    if rssi == rssi_prev1 == rssi_prev2 == None:
-        print datetime.datetime.now(), "can't detect address"
-        time.sleep(3)
-
-    elif rssi == rssi_prev1 == rssi_prev2 == 0:
-        # change state if nearby
-        if far:
-            far = False
-            far_count = 0
-            os.system(near_cmd)
-            print datetime.datetime.now(), "changing to near"
-
-        time.sleep(2)
-
-    elif rssi < -2 and rssi_prev1 < -2 and rssi_prev2 < -2:
-        # if were near and single has been consisitenly low
-
-        # need 10 in a row to set to far
-        far_count += 1
-        if not far and far_count > 10:
-            # switch state to far
-            far = True
-            far_count = 0
-            os.system(far_cmd)
-            print datetime.datetime.now(), "changing to far"
-            time.sleep(5)
-
-    else:
-        far_count = 0
-
-
-    rssi_prev1 = rssi
-    rssi_prev2 = rssi_prev1
+    data = device_inquiry_with_with_rssi(sock)
+    print "debug: ", data
+    for device in data:
+        try:
+            name = list_of_devices[device[0]] if device[0] in list_of_devices else "unknown"
+            distance = estimate_range(device[1])
+            device_data = {"MAC": device[0], "range (meters)": distance, "RSSI": device[1], "Name": name}
+            print device_data
+        except Exception as e:
+            print ("chybycka", e)
