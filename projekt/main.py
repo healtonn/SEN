@@ -4,6 +4,7 @@ import sys
 import struct
 import json
 import time
+import paho.mqtt.client as paho
 import bluetooth._bluetooth as bluez
 import bluetooth
 
@@ -99,11 +100,51 @@ def device_inquiry_with_with_rssi(sock):
 
 
 def estimate_range(rssi):
-    default_RSSI = -42 # rssi value at 1 meter
-    
-    range = 1
+    default_RSSI = -46 # rssi value at 1 meter
+    RSSI_DOUBLE_RANGE_VALUE = 6.0
+    CORRECTION = 1.2
+    tmp = default_RSSI - rssi
+    if tmp < 6:
+        return 1.0
+
+    tmp1 = tmp / RSSI_DOUBLE_RANGE_VALUE
+    range = 2**tmp1
+    range = range / CORRECTION
 
     return range
+
+
+def prepare_json_data(my_data):
+    my_data = json.dumps(my_data)
+    my_data = my_data.encode('utf-8')
+    return my_data
+
+#define callback
+def on_message(client, userdata, message):
+    time.sleep(1)
+    print ("received message: ", str(message.payload.decode('utf-8')))
+
+
+class MQTT:
+    def __init__(self):
+        self.broker = "test.mosquitto.org"
+        self.port = 1883
+
+        self.client = paho.Client("python_client", self.port)
+        self.client.on_message=on_message
+        #print "connecting to: ", self.broker
+        self.client.connect(self.broker)
+        self.client.loop_start()
+
+    def stop(self):
+        self.client.disconnect()
+        self.client.loop_stop()
+
+    def publish(self, data):
+        #print "publishing..."
+        self.client.publish("xjochl00/SEN", data)
+
+
 
 dev_id = 0
 try:
@@ -123,11 +164,15 @@ except Exception as e:
 nearby = bluetooth.discover_devices(lookup_names=True)
 list_of_devices = {}
 for addr, name in nearby:
-    print addr, name
     list_of_devices[addr] = name
+    if '-d' in sys.argv:
+        print addr, name
 
 
-
+if '-m' in sys.argv:
+    print "not using mqtt"
+else:
+    mqtt = MQTT()
 time_now = time.time()
 
 while True:
@@ -137,12 +182,22 @@ while True:
             list_of_devices[addr] = name
 
     data = device_inquiry_with_with_rssi(sock)
-    print "debug: ", data
     for device in data:
         try:
+            device_data = {}
             name = list_of_devices[device[0]] if device[0] in list_of_devices else "unknown"
             distance = estimate_range(device[1])
-            device_data = {"MAC": device[0], "range (meters)": distance, "RSSI": device[1], "Name": name}
-            print device_data
+            device_data = {'MAC': device[0], 'range (meters)': distance, 'RSSI': device[1], 'Name': name}
+            json_data = prepare_json_data(device_data)
+            if '-d' in sys.argv:
+                print json_data
+
+            if '-m' in sys.argv:
+                pass
+            else:
+                mqtt.publish(json_data)
+
         except Exception as e:
-            print ("chybycka", e)
+            print ("chybicka", e)
+
+    print ''
